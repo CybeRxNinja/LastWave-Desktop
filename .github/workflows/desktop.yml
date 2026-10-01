@@ -179,9 +179,76 @@ jobs:
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
           export VERSION="${GITHUB_REF_NAME#v}"
           echo "Packaging version $VERSION"
+
+          # --- Arch pkgver: make it increase once per release ----------
+          #
+          # nFPM builds the Arch pkgver as
+          #   fmt.Sprintf("%s-%d", info.Version, pkgrel)
+          # (arch/arch.go:293), with pkgrel defaulting to 1 because
+          # nfpm.yaml sets no `release:`. nfpm.yaml pins a static
+          # `version: ${VERSION}` derived from the tag, and the agent
+          # tags only differ AFTER the first dot segment's package
+          # identity, so v1.0.0-agent.2 and v1.0.0-agent.3 both produced
+          # pkgver 1.0.0-1 and `pacman -U` refused to upgrade:
+          #   warning: lastwave-desktop-1.0.0-1 is up to date -- reinstalling
+          #
+          # There is no clean override to fix this, which is why the
+          # config is rewritten into a COPY below:
+          #  * `nfpm package` has no --version/--release flag. Its only
+          #    flags are --config/-f, --target/-t and --packager/-p
+          #    (internal/cmd/package.go).
+          #  * `overrides.archlinux.version` is not a thing: the
+          #    Overridables struct has no Version/Release field
+          #    (nfpm.go:359-375) and the YAML decoder is strict
+          #    (dec.KnownFields(true), nfpm.go:88), so an unknown key
+          #    there is a hard parse error, not an override. Version is
+          #    also merged from Info, not Overridables (nfpm.go:141-154).
+          #  * `version: ${ARCH_VERSION}` env expansion does work
+          #    (nfpm.go:209) but it is the single top-level version
+          #    shared by all packagers, so using it would move deb and
+          #    rpm too.
+          # The COPY approach keeps deb and rpm byte-identical to before:
+          # only the archlinux invocation gets --config of the rewrite.
+          #
+          # Monotonicity comes from GITHUB_RUN_NUMBER (a per-run counter
+          # of THIS workflow), not from comparing tag strings, so it does
+          # not depend on lexically sorting tags. pacman's vercmp compares
+          # dot-separated numeric segments numerically, so run 10 > run 9
+          # (1.0.0.agent.4.10-1 > 1.0.0.agent.4.9-1) and ordering is
+          # never affected by the tag's own segment widths.
+          #
+          # Legal pkgver: no whitespace, no "/", and no "-" in the
+          # version part (a hyphen would make pacman split pkgver/pkgrel
+          # wrongly; nFPM appends its own "-<release>"). The tag is
+          # sanitised in shell, never by hand: only [a-z0-9._] survives,
+          # so v1.0.0-agent.4 becomes 1.0.0.agent.4 rather than the
+          # illegal 1.0.0-agent.4.
+          sanitise_tag() {
+            printf '%s' "${1#v}" \
+              | tr 'A-Z' 'a-z' \
+              | tr -c 'a-z0-9._' '.' \
+              | sed -e 's/\.\{2,\}/./g' -e 's/^\.*//' -e 's/\.*$//'
+          }
+          ARCH_BASE="$(sanitise_tag "$GITHUB_REF_NAME")"
+          # A tag made only of illegal characters leaves nothing behind.
+          [ -n "$ARCH_BASE" ] || ARCH_BASE="0.0.0"
+          ARCH_VERSION="${ARCH_BASE}.${GITHUB_RUN_NUMBER}"
+          # Fail loudly rather than shipping an un-upgradeable package.
+          case "$ARCH_VERSION" in
+            *-*|*/*|*" "*|'') echo "::error::illegal Arch version: '$ARCH_VERSION'"; exit 1 ;;
+          esac
+          echo "Arch pkgver will be ${ARCH_VERSION}-1 (tag ${GITHUB_REF_NAME}, run ${GITHUB_RUN_NUMBER})"
+          ARCH_CONFIG="${RUNNER_TEMP}/nfpm-archlinux.yaml"
+          # Anchored to column 0 so only the top-level `version:` is
+          # rewritten; `version: ${VERSION}` is the sole column-0 match.
+          sed "s|^version: .*|version: ${ARCH_VERSION}|" \
+            linux/packaging/nfpm.yaml > "$ARCH_CONFIG"
+          diff -u linux/packaging/nfpm.yaml "$ARCH_CONFIG" || true
+          # ----------------------------------------------------------------
+
           ~/go/bin/nfpm package --config linux/packaging/nfpm.yaml --packager deb --target ./lastwave-desktop_${VERSION}_amd64.deb
           ~/go/bin/nfpm package --config linux/packaging/nfpm.yaml --packager rpm --target ./lastwave-desktop_${VERSION}_x86_64.rpm
-          ~/go/bin/nfpm package --config linux/packaging/nfpm.yaml --packager archlinux --target ./lastwave-desktop_${VERSION}_x86_64.pkg.tar.zst
+          ~/go/bin/nfpm package --config "$ARCH_CONFIG" --packager archlinux --target ./lastwave-desktop_${VERSION}_x86_64.pkg.tar.zst
           ls -la lastwave-desktop_${VERSION}_amd64.deb lastwave-desktop_${VERSION}_x86_64.rpm lastwave-desktop_${VERSION}_x86_64.pkg.tar.zst
 
       - name: Upload Linux Packages
