@@ -188,7 +188,10 @@ void main() {
       // never be dressed up as a fabricated support list.
       expect(d.formats, isEmpty);
       expect(d.supports(pcm), isFalse);
-      expect(d.supportedSummary, 'No exclusive PCM formats reported');
+      expect(
+        d.supportedSummary,
+        'ALSA hw: PCM · no mixer in path · format confirmed at open',
+      );
     });
 
     test('loopback is kept but labelled as a sink', () {
