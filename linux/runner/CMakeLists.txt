@@ -10,6 +10,7 @@ add_executable(${BINARY_NAME}
   "main.cc"
   "my_application.cc"
   "yt_webview_guard.cc"
+  "alsa_channel.cc"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
 )
 
@@ -20,8 +21,15 @@ apply_standard_settings(${BINARY_NAME})
 # Add preprocessor definitions for the application ID.
 add_definitions(-DAPPLICATION_ID="${APPLICATION_ID}")
 
+# Native ALSA capability probe (alsa_channel.cc) needs alsa-lib for
+# snd_pcm_open / snd_pcm_hw_params_test_*. PkgConfig is already found by
+# ../CMakeLists.txt, which declares GTK the same way; this mirrors that
+# pattern so the two system dependencies are declared identically.
+pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+
 # Add dependency libraries. Add any application-specific dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::GTK)
+target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::ALSA)
 
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")

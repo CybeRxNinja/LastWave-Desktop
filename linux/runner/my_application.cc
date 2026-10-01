@@ -7,6 +7,7 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
+#include "alsa_channel.h"
 #include "yt_webview_guard.h"
 
 struct _MyApplication {
@@ -103,6 +104,12 @@ static void my_application_activate(GApplication* application) {
   // Own channel for the YouTube sign-in WebView guard (hide/show +
   // X-close interception). See yt_webview_guard.h.
   yt_webview_guard_register(view);
+
+  // Own channel for the native ALSA capability probe
+  // (lastwave/alsa: enumerateDevices/probeDevice/defaultDeviceId), so Linux
+  // can report a real bit-perfect verdict instead of the procfs fallback.
+  // See alsa_channel.h.
+  alsa_channel_register(view);
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
 
