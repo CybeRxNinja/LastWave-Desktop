@@ -793,13 +793,18 @@ void main() {
         ).note,
         'WASAPI Shared — Windows mixer in path',
       );
+      // The null-device shared note is the one string here that is selected by
+      // platform rather than by enumerator (there is no device to carry an
+      // enumerator), so it is asserted per platform. Both texts are unchanged.
       expect(
         negotiator.negotiate(
           source: nativeSource,
           device: null,
           exclusiveRequested: false,
         ).note,
-        'Shared mode — Windows mixer may resample',
+        Platform.isLinux
+            ? 'ALSA Shared — mixer may resample'
+            : 'Shared mode — Windows mixer may resample',
       );
       // The format fallbacks a Windows device gets are still the same ones.
       expect(
