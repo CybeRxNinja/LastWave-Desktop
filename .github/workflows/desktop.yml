@@ -90,6 +90,69 @@ jobs:
             exit 1
           fi
 
+      # Advisory runtime dependency audit. Runs AFTER the libmpv
+      # normalization above so the reported NEEDED set is what actually
+      # ships (.so.2, not .so.1). `ldd` every ELF object in the bundle,
+      # collect unresolved DT_NEEDED entries, dedupe them, and surface
+      # the list in the job log, the step summary and ::warning::
+      # annotations. This is the check that would have caught the
+      # agent.2 Arch package shipping without `keybinder` and dying at
+      # launch with "error while loading shared libraries:
+      # libkeybinder-3.0.so.0".
+      #
+      # Deliberately NON-FATAL. The runner is Ubuntu 22.04, so entries
+      # that 22.04 does not ship but the target distros do (libmpv.so.2
+      # itself, for one) come back "not found" here; failing the job on
+      # the host's own gaps would block every release for a
+      # distro-difference, not a real defect. Annotate and let a human
+      # cross-check names against `overrides.archlinux.depends`.
+      #
+      # Guarded by `[ -d ]` rather than `set -e` on a glob so a missing
+      # bundle skips the audit instead of aborting the build.
+      - name: Audit runtime shared library deps
+        run: |
+          BUNDLE="build/linux/x64/release/bundle"
+          if [ ! -d "$BUNDLE" ]; then
+            echo "Bundle directory $BUNDLE not present - skipping dep audit."
+            exit 0
+          fi
+
+          # Glob is deliberately unquoted so an empty lib/ still yields a
+          # literal pattern; `[ -e ]` filters it out below.
+          for f in "$BUNDLE/lastwave-desktop" "$BUNDLE"/lib/*.so; do
+            [ -e "$f" ] || continue
+            ldd "$f" 2>/dev/null | awk '/not found/ { print $1 }'
+          done | sort -u > /tmp/lastwave-missing-libs.txt
+
+          missing=$(cat /tmp/lastwave-missing-libs.txt)
+
+          {
+            echo "### Runtime dependency audit (\`ldd\` \"not found\")"
+            echo
+            echo "Scanned \`$BUNDLE/lastwave-desktop\` and \`$BUNDLE/lib/*.so\`."
+            echo
+            if [ -z "$missing" ]; then
+              echo "No unresolved shared libraries: every NEEDED entry resolved."
+            else
+              echo "Unresolved shared libraries (advisory - confirm each has a provider in \`linux/packaging/nfpm.yaml\`):"
+              echo
+              echo '```'
+              echo "$missing"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$missing" ]; then
+            echo "Dependency audit: no unresolved shared libraries."
+          else
+            echo "Dependency audit: unresolved shared libraries (advisory only):"
+            echo "$missing"
+            echo "$missing" | while IFS= read -r lib; do
+              [ -n "$lib" ] || continue
+              echo "::warning::unresolved shared library $lib - verify it is declared in linux/packaging/nfpm.yaml"
+            done
+          fi
+
       - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
         with:

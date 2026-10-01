@@ -75,13 +75,16 @@ overrides:
   #       has NO `mpv-libs` split package (the rpm spelling) and no
   #       `libmpv` package, so `mpv` is the only correct name; its
   #       bundled codecs/ffmpeg/deps come in transitively.
+  #   keybinder                  provides libkeybinder-3.0.so.0, linked
+  #       directly by the lastwave-desktop executable. A stock Arch box
+  #       without it dies before main() with "error while loading shared
+  #       libraries: libkeybinder-3.0.so.0". CI installs the matching
+  #       libkeybinder-3.0-dev (desktop.yml), so deb/rpm pulled it in
+  #       transitively and Arch was the only list missing it.
   #
   # Deliberately NOT listed:
   #   vulkan-icd-loader — already an explicit dependency of Arch's `mpv`
   #       package, so declaring it here would be redundant.
-  #   keybinder — CI installs libkeybinder-3.0-dev, but no plugin in
-  #       pubspec.yaml links it and there is no Arch `keybinder`
-  #       package; unproven, so left out rather than guessed.
   archlinux:
     depends:
       - gtk3
@@ -89,3 +92,4 @@ overrides:
       - libayatana-appindicator
       - alsa-lib
       - mpv
+      - keybinder
