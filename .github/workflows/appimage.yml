@@ -1,0 +1,127 @@
+# LastWave — AppImage build (x86_64, intended for Arch).
+#
+# Separate workflow from desktop.yml on purpose: desktop.yml is owned by the
+# release/nFPM pipeline (deb + rpm + arch .pkg.tar.zst), and mixing an
+# AppImage job in there would couple the two release paths. This workflow
+# publishes NO release assets — it only uploads a CI artifact. Whoever owns the
+# release should attach the produced AppImage to the release separately if it is
+# wanted there.
+#
+# Cost note: the Flutter build steps are duplicated inside this job rather than
+# shared via `workflow_run` or `needs:`. Cross-workflow `needs:` is impossible
+# and `workflow_run` would be a fragile artifact-download coupling. Duplicating
+# the minimal build means a second Flutter build per v* tag run; that is
+# accepted deliberately.
+name: Build AppImage
+
+on:
+  push:
+    tags:
+    - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-appimage:
+    name: Build AppImage (x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # Copied verbatim from the build-linux job in desktop.yml (lines 33-38):
+    # the Flutter Linux runner needs libgtk-3-dev and libwebkit2gtk-4.1-dev to
+    # configure at all, patchelf/objdump/binutils are used by the libmpv
+    # normalization step below.
+    - name: Install Linux build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          clang cmake ninja-build pkg-config patchelf binutils \
+          libgtk-3-dev liblzma-dev libstdc++-12-dev \
+          libayatana-appindicator3-dev libasound2-dev libmpv-dev mpv \
+          libkeybinder-3.0-dev libwebkit2gtk-4.1-dev
+
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        channel: stable
+        cache: true
+
+    # Same secret injection as build-linux in desktop.yml (lines 46-56): CI has
+    # no .env (gitignored), and addon calls fail closed server-side without it.
+    - name: Write .env from secrets
+      run: echo "ADDON_CLIENT_SECRET=${{ secrets.ADDON_CLIENT_SECRET }}" > .env
+
+    - name: Generate Obfuscated Secrets
+      run: dart tool/obfuscate_secrets.dart
+
+    - name: Install dependencies
+      run: flutter pub get
+
+    - name: Build Linux app
+      run: flutter build linux --release
+
+    # Required for the AppImage to run on Arch, and copied from desktop.yml
+    # lines 77-91. Ubuntu 22.04 ships mpv 0.34 (SONAME libmpv.so.1) but Arch
+    # ships only libmpv.so.2, so without this the loader dies before main().
+    # Do not drop this step: the AppImage targets Arch, not Ubuntu.
+    - name: Normalize libmpv linkage
+      run: |
+        BUNDLE="build/linux/x64/release/bundle/lib"
+        for f in "$BUNDLE"/libmedia_kit_video_plugin.so "$BUNDLE"/libmedia_kit_native_event_loop.so; do
+          if objdump -p "$f" | grep -q "NEEDED.*libmpv.so.1"; then
+            echo "Retargeting $f: libmpv.so.1 -> libmpv.so.2"
+            patchelf --replace-needed libmpv.so.1 libmpv.so.2 "$f"
+          fi
+        done
+        if objdump -p "$BUNDLE"/libmedia_kit_video_plugin.so "$BUNDLE"/libmedia_kit_native_event_loop.so | grep -q "NEEDED.*libmpv.so.1"; then
+          echo "::error::libmpv.so.1 linkage survived normalization"
+          exit 1
+        fi
+
+    # No sudo: appimagetool refuses to run as root and the runner is already a
+    # normal user. The script downloads its own pinned appimagetool.
+    - name: Assemble AppDir and build AppImage
+      run: tool/build_appimage.sh
+
+    - name: Summary
+      if: always()
+      run: |
+        {
+          echo "### AppImage build"
+          echo
+          echo "**\`LastWave-Arch-x86_64.AppImage\` is NOT a self-contained image.**"
+          echo
+          echo "Only the Flutter bundle (Dart AOT library, engine, app plugin"
+          echo "\`.so\` files) is embedded. GTK3, WebKit2GTK and the ALSA/mpv"
+          echo "stack are **not** bundled — bundling webkit2gtk is infeasible —"
+          echo "so the **host** must provide:"
+          echo
+          echo "| Arch package | provides |"
+          echo "| --- | --- |"
+          echo "| \`gtk3\` | \`libgtk-3.so.0\` |"
+          echo "| \`webkit2gtk-4.1\` | \`libwebkit2gtk-4.1.so.0\` |"
+          echo "| \`libayatana-appindicator\` | tray icon (\`tray_menu.so\`) |"
+          echo "| \`alsa-lib\` | \`libasound.so.2\` |"
+          echo "| \`mpv\` | \`libmpv.so.2\` |"
+          echo
+          echo "All are standard on Arch; see \`linux/packaging/nfpm.yaml\`"
+          echo "(\`overrides.archlinux.depends\`) for the same mapping used by the"
+          echo "\`.pkg.tar.zst\` package."
+          echo
+          if [ -f dist/LastWave-Arch-x86_64.AppImage ]; then
+            echo "Size: \`$(du -h dist/LastWave-Arch-x86_64.AppImage | cut -f1)\`."
+          else
+            echo "**No AppImage was produced — see the failing step above.**"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload AppImage
+      uses: actions/upload-artifact@v4
+      with:
+        name: LastWave-Arch-x86_64-AppImage
+        path: dist/LastWave-Arch-x86_64.AppImage
+        if-no-files-found: error
