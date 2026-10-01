@@ -75,12 +75,24 @@ overrides:
   #       has NO `mpv-libs` split package (the rpm spelling) and no
   #       `libmpv` package, so `mpv` is the only correct name; its
   #       bundled codecs/ffmpeg/deps come in transitively.
-  #   keybinder                  provides libkeybinder-3.0.so.0, linked
-  #       directly by the lastwave-desktop executable. A stock Arch box
-  #       without it dies before main() with "error while loading shared
-  #       libraries: libkeybinder-3.0.so.0". CI installs the matching
-  #       libkeybinder-3.0-dev (desktop.yml), so deb/rpm pulled it in
-  #       transitively and Arch was the only list missing it.
+  #   libkeybinder3              provides usr/lib/libkeybinder-3.0.so.0,
+  #       linked directly by the lastwave-desktop executable. A stock Arch
+  #       box without it dies before main() with "error while loading
+  #       shared libraries: libkeybinder-3.0.so.0". CI installs the
+  #       matching libkeybinder-3.0-dev (desktop.yml), so deb/rpm pulled
+  #       it in transitively and Arch was the only list missing it.
+  #       The name is `libkeybinder3`, NOT the library spelling
+  #       `keybinder`: that name does not exist, so
+  #       `pacman -U lastwave-desktop-1.0.0-1-x86_64.pkg.tar.zst` failed
+  #       with `warning: cannot resolve "keybinder", a dependency of
+  #       "lastwave-desktop"`. Checked against the official repos:
+  #       archlinux.org/packages/extra/x86_64/libkeybinder3/ is the only
+  #       hit for the search json `?q=keybinder` (extra/libkeybinder3
+  #       0.3.2-5, and its /files/ listing ships
+  #       usr/lib/libkeybinder-3.0.so.0), and there is no AUR fallback
+  #       (aur.archlinux.org/rpc/v5/info?arg[]=libkeybinder3 returns
+  #       resultcount 0), so the dependency is satisfiable only under
+  #       this exact name.
   #
   # Deliberately NOT listed:
   #   vulkan-icd-loader — already an explicit dependency of Arch's `mpv`
@@ -92,4 +104,4 @@ overrides:
       - libayatana-appindicator
       - alsa-lib
       - mpv
-      - keybinder
+      - libkeybinder3
