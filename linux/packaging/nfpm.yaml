@@ -1,4 +1,4 @@
-# LastWave — Linux system packages (deb + rpm) via nFPM.
+# LastWave — Linux system packages (deb + rpm + arch) via nFPM.
 # Built ONLY for releases (v* tags); see .github/workflows/desktop.yml.
 # VERSION comes from the tag (v1.0.0 -> 1.0.0); nFPM expands env vars.
 name: lastwave-desktop
@@ -45,3 +45,47 @@ overrides:
       - libappindicator-gtk3
       - alsa-lib
       - mpv-libs
+  # The packager key is `archlinux`, NOT `arch`: every overrides key is
+  # validated against the registered packager names (Config.Validate ->
+  # Get()), and `arch` is not one of them, so an `arch:` block fails the
+  # whole run. Same reason the CLI flag is `--packager archlinux`.
+  #
+  # pacman resolves against Arch package names, and none of the deb/rpm
+  # spellings above exist in the Arch repos — every name below was
+  # checked against archlinux.org/packages/search (all in `extra`):
+  #
+  #   gtk3                     provides libgtk-3.so.0
+  #       -> GTK is a hard build dep of the runner:
+  #          linux/CMakeLists.txt:55 pkg_check_modules(GTK ... gtk+-3.0)
+  #          and the CI apt list installs libgtk-3-dev (desktop.yml).
+  #   webkit2gtk-4.1           provides libwebkit2gtk-4.1.so.0
+  #       -> desktop_webview_window plugin (pubspec.yaml:76) links the
+  #          4.1 API; CI installs libwebkit2gtk-4.1-dev (desktop.yml).
+  #          (Plain `webkit2gtk` is the 4.0 build — wrong ABI here.)
+  #   libayatana-appindicator  tray_menu.so, pulled in by tray_manager
+  #       (pubspec.yaml:56); CI installs libayatana-appindicator3-dev
+  #       (desktop.yml). Depends gtk3 itself, so it transitively covers
+  #       the appindicator + dbusmenu stack.
+  #   alsa-lib                 provides libasound.so.2 — the default ALSA
+  #       output of the media_kit pipeline (pubspec.yaml:51);
+  #       CI installs libasound2-dev (desktop.yml).
+  #   mpv                      provides libmpv.so.2 — the SONAME the
+  #       media_kit_* plugins are normalized to in the "Normalize libmpv
+  #       linkage" step of desktop.yml (patchelf .so.1 -> .so.2). Arch
+  #       has NO `mpv-libs` split package (the rpm spelling) and no
+  #       `libmpv` package, so `mpv` is the only correct name; its
+  #       bundled codecs/ffmpeg/deps come in transitively.
+  #
+  # Deliberately NOT listed:
+  #   vulkan-icd-loader — already an explicit dependency of Arch's `mpv`
+  #       package, so declaring it here would be redundant.
+  #   keybinder — CI installs libkeybinder-3.0-dev, but no plugin in
+  #       pubspec.yaml links it and there is no Arch `keybinder`
+  #       package; unproven, so left out rather than guessed.
+  archlinux:
+    depends:
+      - gtk3
+      - webkit2gtk-4.1
+      - libayatana-appindicator
+      - alsa-lib
+      - mpv

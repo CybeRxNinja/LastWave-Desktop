@@ -104,7 +104,13 @@ jobs:
         with:
           go-version: stable
 
-      - name: Build deb/rpm packages
+      # nFPM's Arch packager is selected with `--packager archlinux`, NOT
+      # `arch`: `nfpm package --help` lists the accepted values as
+      # [apk|archlinux|deb|ipk|msix|rpm|srpm], and an unknown value is
+      # rejected before any file is written. It emits a `*.pkg.tar.zst`,
+      # and `arch: amd64` in nfpm.yaml is mapped to `x86_64` for this
+      # packager, hence the x86_64 filename.
+      - name: Build deb/rpm/arch packages
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
@@ -112,7 +118,8 @@ jobs:
           echo "Packaging version $VERSION"
           ~/go/bin/nfpm package --config linux/packaging/nfpm.yaml --packager deb --target ./lastwave-desktop_${VERSION}_amd64.deb
           ~/go/bin/nfpm package --config linux/packaging/nfpm.yaml --packager rpm --target ./lastwave-desktop_${VERSION}_x86_64.rpm
-          ls -la lastwave-desktop_${VERSION}_amd64.deb lastwave-desktop_${VERSION}_x86_64.rpm
+          ~/go/bin/nfpm package --config linux/packaging/nfpm.yaml --packager archlinux --target ./lastwave-desktop_${VERSION}_x86_64.pkg.tar.zst
+          ls -la lastwave-desktop_${VERSION}_amd64.deb lastwave-desktop_${VERSION}_x86_64.rpm lastwave-desktop_${VERSION}_x86_64.pkg.tar.zst
 
       - name: Upload Linux Packages
         if: startsWith(github.ref, 'refs/tags/v')
@@ -122,6 +129,7 @@ jobs:
           path: |
             lastwave-desktop_*_amd64.deb
             lastwave-desktop_*_x86_64.rpm
+            lastwave-desktop_*_x86_64.pkg.tar.zst
 
   build-windows:
     name: Build Windows Bundle
