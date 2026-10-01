@@ -250,3 +250,53 @@ jobs:
         with:
           name: LastWave-Desktop-macOS
           path: LastWave-Desktop-macos.zip
+
+  # Analyzer + test gate. Kept as its own job (the analyze/test steps in
+  # build-linux are commented out) so a broken test fails fast in ~2 min
+  # instead of after a full Linux bundle build, and so push/PR feedback
+  # exists even when the release jobs are tag-gated.
+  analyze-test:
+    name: Analyze and Test
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Same toolchain build-linux installs, untrimmed: analyze resolves
+      # Linux plugin/build imports and the media_kit package needs
+      # libmpv-dev present even for a host-side `flutter test`.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+          clang cmake ninja-build pkg-config patchelf binutils \
+          libgtk-3-dev liblzma-dev libstdc++-12-dev \
+          libayatana-appindicator3-dev libasound2-dev libmpv-dev mpv \
+          libkeybinder-3.0-dev libwebkit2gtk-4.1-dev
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # lib/core/env/app_env.dart imports the gitignored, generated
+      # secrets.g.dart — without it analyze reports a missing-import
+      # error and every test importing app_env.dart fails to compile.
+      # No .env is written here on purpose: the generated constants stay
+      # empty, and the addon tests self-skip on an empty secret, so the
+      # gate needs no repo secret. Release builds still inject the real
+      # ADDON_CLIENT_SECRET in build-linux.
+      - name: Generate Obfuscated Secrets
+        run: dart tool/obfuscate_secrets.dart
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Errors fail the job; warnings/infos are reported but tolerated
+      # (--no-fatal-warnings) so lint backlog does not block the gate.
+      - name: Analyze
+        run: flutter analyze --no-fatal-warnings
+
+      - name: Test
+        run: flutter test

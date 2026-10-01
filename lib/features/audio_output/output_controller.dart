@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -6,6 +7,7 @@ import '../../core/audio/stream_models.dart';
 import '../../core/storage/prefs.dart';
 import '../player/playback_service.dart';
 import '../player/player_state.dart';
+import 'alsa_engine.dart';
 import 'dac_device.dart';
 import 'format_negotiator.dart';
 import 'output_path_status.dart';
@@ -65,11 +67,37 @@ class AudioOutputState {
       );
 }
 
-/// Owns WASAPI device selection, exclusive-mode mpv properties, hardware
-/// volume, and the bit-perfect status machine. Does not replace media_kit.
+/// The device engine this platform drives: ALSA on Linux, WASAPI
+/// everywhere else.
+///
+/// Off both platforms [WasapiEngine] is still returned, but its
+/// [WasapiEngine.isSupported] is false, so the status machine keeps
+/// running and honestly reports "device unavailable" instead of throwing.
+///
+/// The argument exists so the choice is testable without mocking
+/// `dart:io`, and the return is `Object` because the two engines have no
+/// common supertype.
+Object audioOutputEngineFor({required bool linux}) =>
+    linux ? const AlsaEngine() : const WasapiEngine();
+
+/// Owns WASAPI/ALSA device selection, exclusive-mode mpv properties,
+/// hardware volume, and the bit-perfect status machine. Does not replace
+/// media_kit.
 class AudioOutputController extends StateNotifier<AudioOutputState> {
   final Ref _ref;
-  final WasapiEngine _engine;
+
+  /// The device engine for this platform.
+  ///
+  /// `dynamic` on purpose: [WasapiEngine] and [AlsaEngine] share a member
+  /// set but have no common supertype, and this slice deliberately does
+  /// not add an interface just to name the union. Every call site below
+  /// is reached only through [audioOutputEngineFor], so the two shapes
+  /// are chosen in exactly one place.
+  final dynamic _engine;
+
+  /// True when this platform's engine is ALSA rather than WASAPI.
+  bool get _isAlsa => _engine is AlsaEngine;
+
   final FormatNegotiator _negotiator;
   StreamSubscription<Map<String, dynamic>>? _hotplug;
   bool _attached = false;
@@ -80,7 +108,7 @@ class AudioOutputController extends StateNotifier<AudioOutputState> {
   double _preMuteVolume = 1.0;
 
   AudioOutputController(this._ref, {WasapiEngine? engine})
-      : _engine = engine ?? const WasapiEngine(),
+      : _engine = engine ?? audioOutputEngineFor(linux: Platform.isLinux),
         _negotiator = const FormatNegotiator(),
         super(const AudioOutputState()) {
     final prefs = _ref.read(prefsProvider);
@@ -101,9 +129,13 @@ class AudioOutputController extends StateNotifier<AudioOutputState> {
     if (_attached) return;
     _attached = true;
     await refreshDevices();
-    _hotplug = _engine.deviceEvents.listen((event) {
-      unawaited(_onHotplug(event));
-    });
+    // ALSA has no hotplug event stream — procfs is polled by
+    // refreshDevices(), and there is no native watcher on Linux.
+    if (!_isAlsa) {
+      _hotplug = _engine.deviceEvents.listen((event) {
+        unawaited(_onHotplug(event));
+      });
+    }
     await applyToPlayer();
     _rebuildPath();
   }
@@ -168,11 +200,19 @@ class AudioOutputController extends StateNotifier<AudioOutputState> {
             device: device,
             exclusiveRequested: exclusive,
           );
+    // ALSA has no probed format list to negotiate against, so the
+    // negotiated output is always null there. Hand the player the SOURCE
+    // instead: `ao=alsa` is told to force exactly that rate/depth on the
+    // raw hw: PCM, which is the whole of what can be asked for without
+    // alsa-lib. `_refreshAoFormat` then reports what actually came out.
+    final outputFormat = exclusive
+        ? (decision?.output ?? (_isAlsa ? source : null))
+        : null;
     await playback.configureWasapi(
       exclusive: exclusive,
       mpvDevice: device?.mpvDeviceName ?? 'auto',
       lockSoftwareVolume: exclusive,
-      outputFormat: exclusive ? decision?.output : null,
+      outputFormat: outputFormat,
     );
     if (hw) {
       final vol = _ref.read(playbackServiceProvider).volume;
@@ -312,11 +352,17 @@ class AudioOutputController extends StateNotifier<AudioOutputState> {
     final playback = _ref.read(playbackServiceProvider.notifier);
     final hw = exclusive && (device?.hardwareVolume ?? false);
     final softwareVol = !hw && snap.volume < 0.999;
+    // "Exclusive" means different things per backend. On Windows the driver
+    // opened one of the probed exclusive PCM formats, so a non-null
+    // negotiated output is part of the claim. On Linux `ao=alsa` on a raw
+    // `hw:` PCM bypasses `dmix`/`plughw` and therefore the mixer, so the
+    // claim follows the ao alone — the format list is empty by
+    // construction on this backend and must not veto the ao.
     final exclusiveActive = exclusive &&
         playback.exclusiveApplied &&
         playback.wasapiError == null &&
         (device?.exclusiveSupported ?? false) &&
-        (decision?.output != null);
+        (_isAlsa || decision?.output != null);
     final reason = _negotiator.evaluate(
       decision: decision ??
           FormatDecision(
@@ -328,7 +374,16 @@ class AudioOutputController extends StateNotifier<AudioOutputState> {
           ),
       exclusiveRequested: exclusive,
       exclusiveActive: exclusiveActive,
-      deviceAvailable: device != null || !_engine.isSupported,
+      // "Available" is about the DEVICE, not about its probed format list:
+      // an ALSA device with empty `formats` is present and must not be
+      // reported unavailable — it reports `exclusiveUnavailable`, which
+      // is the real (and much smaller) gap.
+      //
+      // On Linux a null selection is the ALSA default, which exists and
+      // plays; it simply cannot be exclusive (there is no `hw:` string to
+      // hand libmpv), so that is `exclusiveUnavailable` too.
+      deviceAvailable:
+          device != null || _isAlsa || !_engine.isSupported,
       dspActive: false,
       peqActive: false,
       softwareVolume: softwareVol,

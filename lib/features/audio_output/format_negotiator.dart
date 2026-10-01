@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'dac_device.dart';
 import 'output_path_status.dart';
 import 'pcm_format.dart';
@@ -23,7 +25,9 @@ class FormatNegotiator {
         formatConversion: exclusiveRequested,
         note: exclusiveRequested
             ? 'No output device selected'
-            : 'Shared mode — Windows mixer may resample',
+            : (Platform.isLinux
+                ? 'ALSA Shared — mixer may resample'
+                : 'Shared mode — Windows mixer may resample'),
       );
     }
 
@@ -34,7 +38,9 @@ class FormatNegotiator {
         nativeMatch: false,
         resampling: true,
         formatConversion: true,
-        note: 'WASAPI Shared — Windows mixer in path',
+        note: device.enumerator == 'alsa'
+            ? 'ALSA Shared — mixer may resample'
+            : 'WASAPI Shared — Windows mixer in path',
       );
     }
 
@@ -45,7 +51,12 @@ class FormatNegotiator {
         nativeMatch: false,
         resampling: true,
         formatConversion: true,
-        note: 'WASAPI Exclusive unavailable on ${device.name}',
+        // An ALSA device ALWAYS lands here: probing a PCM needs
+        // alsa-lib, so `formats` is empty by construction and the empty
+        // list must not read as "this DAC cannot do it".
+        note: device.enumerator == 'alsa'
+            ? 'ALSA exclusive unavailable / unknown format (no native probe)'
+            : 'WASAPI Exclusive unavailable on ${device.name}',
       );
     }
 
@@ -138,7 +149,17 @@ class FormatNegotiator {
           ? BitPerfectReason.exclusiveUnavailable
           : BitPerfectReason.sharedMode;
     }
-    if (decision.output == null) return BitPerfectReason.formatUnsupported;
+    if (decision.output == null) {
+      // ALSA cannot reach here with a real format: `ao=alsa` is applied
+      // regardless, so `exclusiveActive` is decided by the ao and the
+      // missing output means "no native probe said what it is", not "no
+      // native format exists". Windows keeps `formatUnsupported` — there
+      // it is unreachable anyway, since a null output also forces
+      // `exclusiveActive` false one branch earlier.
+      return Platform.isLinux
+          ? BitPerfectReason.exclusiveUnavailable
+          : BitPerfectReason.formatUnsupported;
+    }
     if (decision.resampling) return BitPerfectReason.resampling;
     if (decision.formatConversion || !decision.nativeMatch) {
       return BitPerfectReason.formatConversion;

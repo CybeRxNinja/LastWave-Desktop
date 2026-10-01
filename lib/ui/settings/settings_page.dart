@@ -511,7 +511,9 @@ class _Audio extends ConsumerWidget {
           title: 'Audio output',
           subtitle: Platform.isWindows
               ? 'WASAPI Exclusive bypasses the Windows mixer'
-              : 'System audio output',
+              : Platform.isLinux
+                  ? 'ALSA exclusive opens the hw: PCM directly, bypassing the mixer'
+                  : 'System audio output',
           child: _WasapiOutputSettings(onUpdate: onUpdate),
         ),
         const SizedBox(height: 8),
@@ -2117,19 +2119,21 @@ class _WasapiOutputSettings extends ConsumerWidget {
           },
         ),
         const SizedBox(height: 10),
-        if (Platform.isWindows)
+        if (Platform.isWindows || Platform.isLinux)
           _SwitchRow(
             value: output.exclusiveRequested,
             onChanged: (v) async {
               await notifier.setExclusive(v);
               await onUpdate((_) async {});
             },
-            title: 'WASAPI Exclusive',
+            title: Platform.isWindows ? 'WASAPI Exclusive' : 'ALSA Exclusive',
             subtitle: output.path.bitPerfect
                 ? 'Mixer bypassed · bit-perfect when the DAC matches the source'
                 : (output.exclusiveRequested
                       ? output.path.reason.label
-                      : 'Shared mode — mixer may resample'),
+                      : (Platform.isLinux
+                            ? 'ALSA Shared — mixer may resample'
+                            : 'Shared mode — mixer may resample')),
           ),
         const SizedBox(height: 8),
         Text(

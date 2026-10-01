@@ -504,6 +504,15 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
     PcmFormat? outputFormat,
   }) async {
     await ensurePlayer();
+    if (Platform.isLinux) {
+      await _configureAlsa(
+        exclusive: exclusive,
+        mpvDevice: mpvDevice,
+        lockSoftwareVolume: lockSoftwareVolume,
+        outputFormat: outputFormat,
+      );
+      return;
+    }
     if (!Platform.isWindows) {
       _lockSoftwareVolume = false;
       exclusiveApplied = false;
@@ -568,13 +577,7 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
         } catch (_) {}
       }
       exclusiveApplied = exclusive && wasapiError == null;
-      try {
-        if (mpvDevice.isEmpty || mpvDevice == 'auto') {
-          await player.setAudioDevice(AudioDevice.auto());
-        } else {
-          await player.setAudioDevice(AudioDevice(mpvDevice, ''));
-        }
-      } catch (_) {}
+      await _applyAudioDevice(player, mpvDevice);
       if (lockSoftwareVolume) {
         await player.setVolume(100);
       }
@@ -589,6 +592,106 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       );
     }
     unawaited(_refreshAoFormat());
+  }
+
+  /// Linux half of [configureWasapi].
+  ///
+  /// ALSA has no "exclusive mode" flag: exclusivity is decided by WHICH
+  /// PCM gets opened. `ao=alsa` with `audio-device=hw:CARD=<c>,DEV=<n>`
+  /// makes libmpv call `snd_pcm_open` on that exact name, which has no
+  /// `dmix` and no `plughw` — so no mixer and no resampler is in the path
+  /// — while a bare name or `auto` resolves through `plughw` and is
+  /// shared. Nothing here can verify which one libmpv actually opened
+  /// (that needs alsa-lib), so the sample rate, sample format and channel
+  /// count are FORCED from the source and the real verdict is left to
+  /// [_refreshAoFormat] reading `audio-out-params`.
+  Future<void> _configureAlsa({
+    required bool exclusive,
+    required String mpvDevice,
+    required bool lockSoftwareVolume,
+    PcmFormat? outputFormat,
+  }) async {
+    _lockSoftwareVolume = lockSoftwareVolume;
+    final player = _player;
+    if (player == null) {
+      exclusiveApplied = false;
+      wasapiError = 'Player unavailable';
+      return;
+    }
+    exclusiveApplied = false;
+    wasapiError = null;
+    _forcedAoFormat = exclusive && outputFormat != null
+        ? mpvSampleFormat(outputFormat.bitDepth)
+        : null;
+    _crumb('configureWasapi alsa exclusive=$exclusive device=$mpvDevice');
+    await _serializedMpv(() async {
+      final dyn = player.platform as dynamic;
+      try {
+        await dyn.setProperty('ao', 'alsa');
+      } catch (_) {}
+      // Kept for parity with the Windows branch; libmpv only honours this
+      // on wasapi, and a rejected write on alsa must not be reported as
+      // an exclusive failure — the ao itself is the exclusive mechanism.
+      try {
+        await dyn.setProperty('audio-exclusive', exclusive ? 'yes' : 'no');
+      } catch (_) {}
+      // weak = keep the device open only when the next file matches.
+      // yes would resample to hold the old exclusive format open.
+      try {
+        await dyn.setProperty('gapless-audio', exclusive ? 'weak' : 'yes');
+      } catch (_) {}
+      if (exclusive && outputFormat != null) {
+        // Forcing the source PCM is what makes the raw hw: open
+        // bit-perfect: left to itself mpv converts to whatever the
+        // (unprobed) device claims, which is exactly the resampling the
+        // hw: path exists to avoid. Best-effort — a device that cannot do
+        // the rate simply fails the open, and _refreshAoFormat says so.
+        try {
+          await dyn.setProperty(
+              'audio-samplerate', outputFormat.sampleRateHz.toString());
+        } catch (_) {}
+        try {
+          await dyn.setProperty('audio-channels', outputFormat.channels.toString());
+        } catch (_) {}
+        try {
+          await dyn.setProperty('audio-format', _forcedAoFormat);
+        } catch (_) {}
+        try {
+          await dyn.setProperty('af', '');
+        } catch (_) {}
+        try {
+          await dyn.setProperty('replaygain', 'no');
+        } catch (_) {}
+      }
+      // Only a raw hardware PCM is exclusive here. `auto`, a bare name or
+      // anything that went through the alsa/plughw prefix resolves via
+      // the conversion plugin, which is a mixer in the path — so the
+      // claim follows the device string, never the request alone.
+      exclusiveApplied = exclusive &&
+          wasapiError == null &&
+          mpvDevice.startsWith('hw:');
+      await _applyAudioDevice(player, mpvDevice);
+      if (lockSoftwareVolume) {
+        await player.setVolume(100);
+      }
+    }).catchError((e) {
+      exclusiveApplied = false;
+      wasapiError = 'ALSA init failed: $e';
+    });
+    unawaited(_refreshAoFormat());
+  }
+
+  /// Route libmpv's audio output, treating an empty/'auto' name as the
+  /// system default. Failures are swallowed: mpv keeps its previous
+  /// device, which is better than tearing playback down.
+  Future<void> _applyAudioDevice(Player player, String mpvDevice) async {
+    try {
+      if (mpvDevice.isEmpty || mpvDevice == 'auto') {
+        await player.setAudioDevice(AudioDevice.auto());
+      } else {
+        await player.setAudioDevice(AudioDevice(mpvDevice, ''));
+      }
+    } catch (_) {}
   }
 
   Future<void> _refreshAoFormat() async {
