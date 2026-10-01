@@ -138,7 +138,7 @@ class AlsaEngine {
   /// `/proc/asound/default -> cardN` is how ALSA itself resolves the default.
   String? _readDefaultLinkTarget() {
     try {
-      return Link('$_procAsound/default').target;
+      return Link('$_procAsound/default').targetSync();
     } on FileSystemException catch (e) {
       alsaLog('default ALSA card unresolved: ${e.message}');
       return null;
