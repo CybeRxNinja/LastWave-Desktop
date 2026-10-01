@@ -51,11 +51,15 @@ class FormatNegotiator {
         nativeMatch: false,
         resampling: true,
         formatConversion: true,
-        // An ALSA device ALWAYS lands here: probing a PCM needs
-        // alsa-lib, so `formats` is empty by construction and the empty
-        // list must not read as "this DAC cannot do it".
+        // An ALSA device lands here only when its format is genuinely
+        // UNKNOWN, and unknown has two honest causes: this build has no native
+        // probe (the engine falls back to procfs, which measures nothing), or
+        // the probe ran and the PCM could not be opened / accepted none of the
+        // candidates. Neither means "this DAC cannot do it", so the empty list
+        // must not read as a verdict about the DAC. A probed PCM that DOES
+        // list the source continues below and can be bit-perfect on Linux.
         note: device.enumerator == 'alsa'
-            ? 'ALSA exclusive unavailable / unknown format (no native probe)'
+            ? 'ALSA exclusive unavailable / unknown format (PCM not measured)'
             : 'WASAPI Exclusive unavailable on ${device.name}',
       );
     }
@@ -150,12 +154,15 @@ class FormatNegotiator {
           : BitPerfectReason.sharedMode;
     }
     if (decision.output == null) {
-      // ALSA cannot reach here with a real format: `ao=alsa` is applied
-      // regardless, so `exclusiveActive` is decided by the ao and the
-      // missing output means "no native probe said what it is", not "no
-      // native format exists". Windows keeps `formatUnsupported` — there
-      // it is unreachable anyway, since a null output also forces
-      // `exclusiveActive` false one branch earlier.
+      // A null output means the device's format list came back empty, i.e.
+      // UNKNOWN: no native channel in this build, a PCM that could not be
+      // opened, or none of the probed candidates accepted. That is not "no
+      // native format exists", so Linux reports `exclusiveUnavailable` — the
+      // bit-perfect claim is withheld, which is the honest answer either way.
+      // Windows keeps `formatUnsupported`; it is unreachable there anyway,
+      // since a null output also forces `exclusiveActive` false one branch
+      // earlier. With a probed ALSA PCM this branch is never reached: a match
+      // is resolved above, and lands on `bitPerfect` below.
       return Platform.isLinux
           ? BitPerfectReason.exclusiveUnavailable
           : BitPerfectReason.formatUnsupported;

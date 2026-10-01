@@ -200,11 +200,12 @@ class AudioOutputController extends StateNotifier<AudioOutputState> {
             device: device,
             exclusiveRequested: exclusive,
           );
-    // ALSA has no probed format list to negotiate against, so the
-    // negotiated output is always null there. Hand the player the SOURCE
-    // instead: `ao=alsa` is told to force exactly that rate/depth on the
-    // raw hw: PCM, which is the whole of what can be asked for without
-    // alsa-lib. `_refreshAoFormat` then reports what actually came out.
+    // When the format is UNKNOWN the negotiated output is null on both
+    // backends, so hand the player the SOURCE instead: `ao=alsa` is told to
+    // force exactly that rate/depth on the raw hw: PCM, which is the whole of
+    // what can be asked for without a measured list. That is the ALSA shape
+    // whenever the native probe is absent or the PCM could not be opened.
+    // `_refreshAoFormat` then reports what actually came out.
     final outputFormat = exclusive
         ? (decision?.output ?? (_isAlsa ? source : null))
         : null;
@@ -356,8 +357,13 @@ class AudioOutputController extends StateNotifier<AudioOutputState> {
     // opened one of the probed exclusive PCM formats, so a non-null
     // negotiated output is part of the claim. On Linux `ao=alsa` on a raw
     // `hw:` PCM bypasses `dmix`/`plughw` and therefore the mixer, so the
-    // claim follows the ao alone — the format list is empty by
-    // construction on this backend and must not veto the ao.
+    // claim follows the ao alone. That holds whether or not the native probe
+    // measured anything: an unknown format list (no probe in this build, or a
+    // PCM that could not be opened) must not veto an ao that did apply, which
+    // is why the `_isAlsa` disjunct stays even now that a probed PCM does
+    // carry real formats. A probed PCM that does not list the source is then
+    // held to the honest reason — resampling or native format unavailable —
+    // by `FormatNegotiator.evaluate` below.
     final exclusiveActive = exclusive &&
         playback.exclusiveApplied &&
         playback.wasapiError == null &&
@@ -382,6 +388,10 @@ class AudioOutputController extends StateNotifier<AudioOutputState> {
       // On Linux a null selection is the ALSA default, which exists and
       // plays; it simply cannot be exclusive (there is no `hw:` string to
       // hand libmpv), so that is `exclusiveUnavailable` too.
+      //
+      // A missing native probe changes none of this: `AlsaEngine` swallows the
+      // channel error and returns the same devices from procfs, with `formats`
+      // empty, so a fallback list is never mistaken for an absent device.
       deviceAvailable:
           device != null || _isAlsa || !_engine.isSupported,
       dspActive: false,

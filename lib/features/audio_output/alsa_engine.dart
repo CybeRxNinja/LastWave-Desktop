@@ -1,70 +1,91 @@
 import 'dart:developer' as developer;
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:meta/meta.dart';
 
 import 'dac_device.dart';
 
-/// Pure-Dart client for Linux ALSA sound-card discovery.
+/// Dart client for Linux ALSA sound-card discovery.
 ///
 /// Windows gets bit-perfect playback from a native WASAPI engine. The Linux
 /// equivalent of an exclusive open is `snd_pcm_open("hw:CARD=<card>,DEV=<n>")`,
 /// which bypasses `dmix`/`plughw` and therefore the mixer — and libmpv already
 /// does exactly that when the string is handed to it verbatim with `ao=alsa`.
 /// So this engine only has to do the half it can do honestly: enumerate `hw:`
-/// PCMs from procfs and report what we actually know.
+/// PCMs and report what we actually know.
+///
+/// Two sources, in this order:
+///
+/// 1. The native `lastwave/alsa` probe (`linux/runner/alsa_channel.cc`), which
+///    opens each `hw:` PCM through alsa-lib and reports the formats it really
+///    accepts. This is what makes a genuine bit-perfect verdict possible on
+///    Linux instead of "unknown format".
+/// 2. The procfs enumeration below, which names the same `hw:` PCMs from
+///    `/proc/asound` but measures nothing. It is the DEGRADED mode, not a
+///    second opinion: it runs when the channel is absent (a build without the
+///    probe, a host that has none) or when a native call fails, and every
+///    device it returns carries an empty `formats`, which the status line
+///    reports as unknown instead of resolving to a bit-perfect verdict.
 ///
 /// What it deliberately does not do:
 /// - fabricate format lists. Opening a PCM needs alsa-lib, and a guessed
-///   `PcmFormat` would be trusted downstream, so [probeDevice] returns an empty
-///   `formats` (= unknown) and the runtime `audio-out-params` check stays the
-///   single source of truth for bit-perfect.
+///   `PcmFormat` would be trusted downstream, so a PCM that could not be
+///   measured keeps an empty `formats` (= unknown).
 /// - claim hardware volume. There is no control-ABI path in this slice, so
 ///   volume stays software-side and [setHardwareVolume] always fails honestly.
 class AlsaEngine {
+  /// The native probe, the Linux counterpart of `lastwave/wasapi`.
+  ///
+  /// No EventChannel: ALSA has no hotplug stream to publish, and the device
+  /// list is polled, so the only three methods that exist are the three
+  /// answered here.
+  static const _channel = MethodChannel('lastwave/alsa');
+
   const AlsaEngine();
 
   bool get isSupported => Platform.isLinux;
 
   /// Every `hw:` playback PCM, ordered by card index then stream index.
   ///
-  /// procfs raises for every missing node inside containers, WSL sessions
-  /// and sandboxes, so a read failure degrades to `const []` (with a log)
-  /// instead of throwing at the player.
+  /// A probed device carries the formats the DAC really accepts, which is what
+  /// lets the negotiator reach a bit-perfect verdict on Linux. A missing or
+  /// silent channel degrades to the procfs list below, with empty formats, and
+  /// procfs raises for every missing node inside containers, WSL sessions and
+  /// sandboxes — so a read failure degrades to `const []` (with a log) instead
+  /// of throwing at the player.
   Future<List<DacDevice>> enumerateDevices() async {
     if (!isSupported) return const [];
-    final cards = parseAlsaCards(_readProcFile('$_procAsound/cards') ?? '');
-    if (cards.isEmpty) return const [];
-    return buildDacDevices(
-      cards,
-      _readPlaybackStreams(),
-      defaultCardIndex: parseDefaultCardIndex(_readDefaultLinkTarget(), cards),
-    );
+    final probed = alsaDevicesFromNative(await _invoke('enumerateDevices'));
+    if (probed != null) return probed;
+    return _enumerateProcfs();
   }
 
-  /// The same device list with EMPTY `formats`.
+  /// One device, with the formats it really accepts.
   ///
-  /// The id is checked against procfs so a stale preference cannot resurrect a
-  /// DAC that is gone, but nothing is measured: an id procfs never reported is
-  /// unknown, not guessed. A malformed id never even reaches the filesystem.
+  /// The id is checked against the `hw:` shape first, so a malformed id never
+  /// even reaches the channel, and then against what the platform reports, so
+  /// a stale preference cannot resurrect a DAC that is gone. An empty
+  /// `formats` in the answer is passed through as unknown, never filled in.
   Future<DacDevice?> probeDevice(String id) async {
     if (!isSupported) return null;
     if (parseAlsaDeviceId(id) == null) {
       alsaLog('probeDevice: malformed id "$id"');
       return null;
     }
-    final wanted = id.trim().toLowerCase();
-    for (final d in await enumerateDevices()) {
-      if (d.id.toLowerCase() == wanted) return d;
-    }
-    alsaLog('probeDevice: $id is not an ALSA playback PCM');
-    return null;
+    final probed = alsaDeviceFromNative(
+      await _invoke('probeDevice', {'id': id}),
+    );
+    if (probed != null) return probed;
+    return _probeProcfs(id);
   }
 
   /// Always false — no `amixer`/control-ABI access in this slice.
   ///
-  /// Reporting success here would leave the UI showing a hardware-volume knob
-  /// that never touched the DAC, so the player keeps its software volume.
+  /// The native channel answers `not_implemented` for this too, so it is not
+  /// even called: reporting success would leave the UI showing a
+  /// hardware-volume knob that never touched the DAC, so the player keeps its
+  /// software volume.
   Future<bool> setHardwareVolume(String id, double scalar) async {
     if (!isSupported) return false;
     final s = scalar.clamp(0.0, 1.0);
@@ -80,14 +101,62 @@ class AlsaEngine {
 
   /// `hw:CARD=<default card>,DEV=0`, or `''` when nothing is resolvable.
   ///
-  /// Only DEV=0 is flagged default, so returning the first device carrying
-  /// `isDefault` is exactly the `DEV=0` rule the id contract promises.
+  /// Only DEV=0 is flagged default, which is the rule on both sides, so the
+  /// procfs answer is a faithful fallback.
   Future<String> defaultDeviceId() async {
     if (!isSupported) return '';
-    for (final d in await enumerateDevices()) {
+    final probed = await _invoke('defaultDeviceId');
+    if (probed is String && probed.isNotEmpty) return probed;
+    for (final d in _enumerateProcfs()) {
       if (d.isDefault) return d.id;
     }
     return '';
+  }
+
+  /// One native call, degraded to `null`.
+  ///
+  /// `null` is the whole answer, and it covers every way the channel can be
+  /// useless: `MissingPluginException` (this build has no probe, or the host
+  /// has none), `PlatformException` (the probe raised), and a silent
+  /// `null`/empty payload. Same shape as `WasapiEngine`, plus the missing
+  /// plugin case, and nothing is ever thrown at the player.
+  Future<Object?> _invoke(String method, [Map<String, Object?>? args]) async {
+    try {
+      // `Object?` instead of the expected element type on purpose: a payload
+      // of the wrong shape then reaches the pure mapping as "no answer"
+      // rather than raising a cast error at the call site.
+      return await _channel.invokeMethod<Object?>(method, args);
+    } on MissingPluginException catch (e) {
+      alsaLog('$method: no native ALSA probe (${e.message}) — procfs fallback');
+    } on PlatformException catch (e) {
+      alsaLog('$method failed: ${e.message} — procfs fallback');
+    }
+    return null;
+  }
+
+  /// Every `hw:` playback PCM from procfs, with EMPTY `formats`.
+  ///
+  /// Nothing is measured: an id procfs never reported is unknown, not guessed.
+  /// This is the degraded path behind [_invoke] returning `null`.
+  List<DacDevice> _enumerateProcfs() {
+    final cards = parseAlsaCards(_readProcFile('$_procAsound/cards') ?? '');
+    if (cards.isEmpty) return const [];
+    return buildDacDevices(
+      cards,
+      _readPlaybackStreams(),
+      defaultCardIndex: parseDefaultCardIndex(_readDefaultLinkTarget(), cards),
+    );
+  }
+
+  /// The procfs answer for one id: the same list, matched case-insensitively
+  /// because the kernel card id case is not guaranteed to round-trip.
+  DacDevice? _probeProcfs(String id) {
+    final wanted = id.trim().toLowerCase();
+    for (final d in _enumerateProcfs()) {
+      if (d.id.toLowerCase() == wanted) return d;
+    }
+    alsaLog('probeDevice: $id is not an ALSA playback PCM');
+    return null;
   }
 
   /// Playback streams per card, `cardN -> [0, 1, ...]`.
@@ -329,6 +398,39 @@ List<DacDevice> parseAlsaDevices({
     streams,
     defaultCardIndex: parseDefaultCardIndex(defaultLink, cards),
   );
+}
+
+/// Test hook: one `enumerateDevices` answer from the native channel as
+/// devices, or `null` when the channel had nothing usable to say.
+///
+/// `null` is the single fallback signal, and it is what every degraded case
+/// produces: the call threw ([MissingPluginException] for a build without the
+/// probe, [PlatformException] for a probe that raised), or the payload was
+/// `null`, empty, or not a list of device maps. Only a non-empty list of maps
+/// is trusted — and inside a device map an empty `formats` is passed through
+/// untouched, because empty means "not measured", never "no formats exist".
+@visibleForTesting
+List<DacDevice>? alsaDevicesFromNative(Object? raw) {
+  if (raw is! List) return null;
+  final devices = raw.whereType<Map>().map(DacDevice.fromJson).toList();
+  return devices.isEmpty ? null : devices;
+}
+
+/// Test hook: one `probeDevice` answer from the native channel, or `null` when
+/// there is none.
+///
+/// The native side answers `null` for an id that is not an ALSA playback PCM
+/// and for a PCM it could not open, and the channel can be missing entirely —
+/// all three mean the caller falls back to the procfs answer for the same id,
+/// which keeps an unopenable device present but honestly unknown instead of
+/// dropping it.
+@visibleForTesting
+DacDevice? alsaDeviceFromNative(Object? raw) {
+  if (raw is! Map) return null;
+  final device = DacDevice.fromJson(raw);
+  // The id is the one key every answer is keyed on, so an answer without one
+  // is not an answer.
+  return device.id.isEmpty ? null : device;
 }
 
 void alsaLog(String message) {

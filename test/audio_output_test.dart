@@ -1,5 +1,6 @@
 import 'dart:io' show Platform;
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lastwave_desktop/features/audio_output/alsa_engine.dart';
 import 'package:lastwave_desktop/features/audio_output/dac_device.dart';
@@ -602,6 +603,220 @@ void main() {
       );
       expect(status.supportedSummary, contains('ALSA'));
       expect(status.supportedSummary, isNot(contains('No exclusive')));
+    });
+  });
+
+  // The payload below is the native `lastwave/alsa` device map, key for key:
+  // `id` is `hw:<card id from snd_ctl_card_info_get_id>,DEV=<pcm index>` and
+  // `formats` holds the alsa-lib measurement, which is EMPTY when the PCM
+  // could not be opened — unknown, never fabricated.
+  const nativePcm = {
+    'id': 'hw:CARD=PCH,DEV=0',
+    'name': 'HDA Intel PCH, ALC295 Analog',
+    'manufacturer': '',
+    'enumerator': 'alsa',
+    'isDefault': true,
+    'exclusiveSupported': true,
+    'hardwareVolume': false,
+    'formats': <Object?>[
+      {'sampleRateHz': 44100, 'bitDepth': 16, 'channels': 2},
+      {'sampleRateHz': 48000, 'bitDepth': 24, 'channels': 2},
+      {'sampleRateHz': 96000, 'bitDepth': 24, 'channels': 2},
+    ],
+  };
+  const nativeSource = PcmFormat(sampleRateHz: 96000, bitDepth: 24);
+
+  group('ALSA native probe drives the verdict', () {
+    test('the native device map is read exactly as sent', () {
+      final probed = DacDevice.fromJson(nativePcm);
+      expect(probed.id, 'hw:CARD=PCH,DEV=0');
+      expect(probed.enumerator, 'alsa');
+      expect(probed.isDefault, isTrue);
+      expect(probed.exclusiveSupported, isTrue);
+      // No control-ABI path on ALSA, so the hardware-volume knob stays hidden.
+      expect(probed.hardwareVolume, isFalse);
+      expect(probed.mpvDeviceName, 'hw:CARD=PCH,DEV=0');
+      expect(
+        probed.formats.map((f) => '${f.label} x${f.channels}').toList(),
+        ['16-bit / 44.1 kHz x2', '24-bit / 48 kHz x2', '24-bit / 96 kHz x2'],
+      );
+      expect(probed.supports(nativeSource), isTrue);
+    });
+
+    test('a probed ALSA PCM with a matching format is bit-perfect', () {
+      final probed = DacDevice.fromJson(nativePcm);
+      final d = negotiator.negotiate(
+        source: nativeSource,
+        device: probed,
+        exclusiveRequested: true,
+      );
+      expect(d.output, nativeSource);
+      expect(d.nativeMatch, isTrue);
+      expect(d.resampling, isFalse);
+      expect(d.formatConversion, isFalse);
+      // The point of the probe: on Linux this verdict used to be unreachable,
+      // because every ALSA device negotiated a null output.
+      expect(
+        negotiator.evaluate(
+          decision: d,
+          exclusiveRequested: true,
+          exclusiveActive: true,
+          deviceAvailable: true,
+          dspActive: false,
+          peqActive: false,
+          softwareVolume: false,
+          crossfade: false,
+          speed: 1.0,
+        ),
+        BitPerfectReason.bitPerfect,
+      );
+    });
+
+    test('a probed ALSA PCM with exclusive inactive is not bit-perfect', () {
+      final d = negotiator.negotiate(
+        source: nativeSource,
+        device: DacDevice.fromJson(nativePcm),
+        exclusiveRequested: true,
+      );
+      // The format is real and matches, but the ao never applied, so the
+      // claim is withheld for the exclusive reason, not a format reason.
+      expect(d.nativeMatch, isTrue);
+      expect(
+        negotiator.evaluate(
+          decision: d,
+          exclusiveRequested: true,
+          exclusiveActive: false,
+          deviceAvailable: true,
+          dspActive: false,
+          peqActive: false,
+          softwareVolume: false,
+          crossfade: false,
+          speed: 1.0,
+        ),
+        BitPerfectReason.exclusiveUnavailable,
+      );
+    });
+
+    test('a probed PCM with EMPTY formats stays on the unknown-format reason',
+        () {
+      // Exactly what the native side sends for a PCM it could not open: the
+      // device is present, `formats` is empty, and empty means unknown.
+      final unprobed = DacDevice.fromJson({
+        ...nativePcm,
+        'formats': <Object?>[],
+      });
+      expect(unprobed.formats, isEmpty);
+      expect(unprobed.supports(nativeSource), isFalse);
+      final d = negotiator.negotiate(
+        source: nativeSource,
+        device: unprobed,
+        exclusiveRequested: true,
+      );
+      expect(d.output, isNull);
+      expect(d.nativeMatch, isFalse);
+      expect(
+        d.note,
+        'ALSA exclusive unavailable / unknown format (PCM not measured)',
+      );
+      final reason = negotiator.evaluate(
+        decision: d,
+        exclusiveRequested: true,
+        exclusiveActive: true,
+        deviceAvailable: true,
+        dspActive: false,
+        peqActive: false,
+        softwareVolume: false,
+        crossfade: false,
+        speed: 1.0,
+      );
+      expect(reason, isNot(BitPerfectReason.bitPerfect));
+      expect(
+        reason,
+        Platform.isLinux
+            ? BitPerfectReason.exclusiveUnavailable
+            : BitPerfectReason.formatUnsupported,
+      );
+    });
+
+    test('a MissingPluginException answer degrades to the procfs list', () {
+      // A build without the probe, a host that never registered the channel,
+      // and a probe that raised all leave the device list to procfs.
+      final missing = MissingPluginException(
+        'No implementation found for method lastwave/alsa.enumerateDevices '
+        'on channel lastwave/alsa',
+      );
+      final procfs = parseAlsaDevices(
+        cardsRaw: ' 0 [PCH   ]: PCH - HDA Intel PCH\n',
+        streams: const {0: [0]},
+        defaultLink: 'card0',
+      );
+      // The engine reads `alsaDevicesFromNative(answer) ?? _enumerateProcfs()`,
+      // so a null answer IS the procfs list: same device, formats unknown,
+      // and still exclusive-capable rather than "unavailable".
+      expect(alsaDevicesFromNative(missing), isNull);
+      expect(alsaDevicesFromNative(missing) ?? procfs, procfs);
+      expect(alsaDeviceFromNative(missing), isNull);
+      expect(procfs.single.id, 'hw:CARD=PCH,DEV=0');
+      expect(procfs.single.exclusiveSupported, isTrue);
+      expect(procfs.single.formats, isEmpty);
+      // A silent or malformed channel is not an answer either.
+      expect(alsaDevicesFromNative(null), isNull);
+      expect(alsaDevicesFromNative(<Object?>[]), isNull);
+      expect(alsaDevicesFromNative(<Object?>[42, 'garbage']), isNull);
+      // A real native list wins over the fallback, measured formats included.
+      expect(alsaDevicesFromNative([nativePcm])!.single.formats.length, 3);
+      expect(alsaDeviceFromNative(nativePcm)!.supports(nativeSource), isTrue);
+      // A probed-but-unmeasurable PCM is still an answer: the device stays
+      // present with `formats` empty, never dropped and never filled in.
+      final unmeasurable =
+          alsaDeviceFromNative({...nativePcm, 'formats': <Object?>[]});
+      expect(unmeasurable, isNotNull);
+      expect(unmeasurable!.id, 'hw:CARD=PCH,DEV=0');
+      expect(unmeasurable.formats, isEmpty);
+    });
+
+    test('the Windows exclusive reason strings are unchanged', () {
+      // The Linux branch must not have leaked into any Windows note.
+      expect(
+        negotiator.negotiate(
+          source: nativeSource,
+          device: dac(exclusive: false, formats: const []),
+          exclusiveRequested: true,
+        ).note,
+        'WASAPI Exclusive unavailable on FiiO K7',
+      );
+      expect(
+        negotiator.negotiate(
+          source: nativeSource,
+          device: dac(),
+          exclusiveRequested: false,
+        ).note,
+        'WASAPI Shared — Windows mixer in path',
+      );
+      expect(
+        negotiator.negotiate(
+          source: nativeSource,
+          device: null,
+          exclusiveRequested: false,
+        ).note,
+        'Shared mode — Windows mixer may resample',
+      );
+      // The format fallbacks a Windows device gets are still the same ones.
+      expect(
+        negotiator.negotiate(
+          source: const PcmFormat(sampleRateHz: 96000, bitDepth: 32),
+          device: dac(),
+          exclusiveRequested: true,
+        ).note,
+        'Native bit depth unavailable — using 24-bit / 96 kHz',
+      );
+      // And the null-output label keeps its own per-platform text.
+      final label = BitPerfectReason.exclusiveUnavailable.label;
+      if (Platform.isLinux) {
+        expect(label, contains('ALSA'));
+      } else {
+        expect(label, 'WASAPI Exclusive unavailable');
+      }
     });
   });
 }
