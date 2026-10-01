@@ -325,6 +325,7 @@ void main() {
     test('one mint blip recovers without falling through', () async {
       if (AppEnv.addonClientSecret.isEmpty) {
         markTestSkipped('addon secret not configured in this env');
+        return;
       }
       final token = _hex('f');
       final dio = Dio();
@@ -351,6 +352,7 @@ void main() {
     test('quota 429 throws immediately (no pointless retry)', () async {
       if (AppEnv.addonClientSecret.isEmpty) {
         markTestSkipped('addon secret not configured in this env');
+        return;
       }
       final token = _hex('f');
       final dio = Dio();
